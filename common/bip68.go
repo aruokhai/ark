@@ -32,6 +32,14 @@ type Locktime struct {
 	Value uint32
 }
 
+func FromConfig(locktime int64) Locktime {
+	if locktime >= 512 {
+		return Locktime{Type: LocktimeTypeSecond, Value: uint32(locktime)}
+	}
+
+	return Locktime{Type: LocktimeTypeBlock, Value: uint32(locktime)}
+}
+
 func (l Locktime) Seconds() int64 {
 	if l.Type == LocktimeTypeBlock {
 		return int64(l.Value) * SECONDS_PER_BLOCK
