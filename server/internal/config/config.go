@@ -83,6 +83,7 @@ type Config struct {
 	NostrDefaultRelays    []string
 	NoteUriPrefix         string
 	OtelCollectorEndpoint string
+	AllowZeroFees         bool
 
 	MarketHourStartTime     time.Time
 	MarketHourEndTime       time.Time
@@ -148,6 +149,7 @@ var (
 	MarketHourPeriod        = "MARKET_HOUR_PERIOD"
 	MarketHourRoundInterval = "MARKET_HOUR_ROUND_INTERVAL"
 	OtelCollectorEndpoint   = "OTEL_COLLECTOR_ENDPOINT"
+	AllowZeroFees           = "ALLOW_ZERO_FEES"
 
 	defaultDatadir             = common.AppDataDir("arkd", false)
 	defaultRoundInterval       = 15
@@ -169,6 +171,7 @@ var (
 	defaultMarketHourEndTime   = defaultMarketHourStartTime.Add(time.Duration(defaultRoundInterval) * time.Second)
 	defaultMarketHourPeriod    = time.Duration(24) * time.Hour
 	defaultMarketHourInterval  = time.Duration(defaultRoundInterval) * time.Second
+	defaultAllowZeroFees       = false
 )
 
 func LoadConfig() (*Config, error) {
@@ -195,6 +198,7 @@ func LoadConfig() (*Config, error) {
 	viper.SetDefault(MarketHourEndTime, defaultMarketHourEndTime)
 	viper.SetDefault(MarketHourPeriod, defaultMarketHourPeriod)
 	viper.SetDefault(MarketHourRoundInterval, defaultMarketHourInterval)
+	viper.SetDefault(AllowZeroFees, defaultAllowZeroFees)
 
 	net, err := getNetwork()
 	if err != nil {
@@ -244,6 +248,7 @@ func LoadConfig() (*Config, error) {
 		MarketHourPeriod:        viper.GetDuration(MarketHourPeriod),
 		MarketHourRoundInterval: viper.GetDuration(MarketHourRoundInterval),
 		OtelCollectorEndpoint:   viper.GetString(OtelCollectorEndpoint),
+		AllowZeroFees:           viper.GetBool(AllowZeroFees),
 	}, nil
 }
 
@@ -567,7 +572,7 @@ func (c *Config) appService() error {
 	svc, err := application.NewCovenantlessService(
 		c.Network, c.RoundInterval, c.VtxoTreeExpiry, c.UnilateralExitDelay, c.BoardingExitDelay, c.NostrDefaultRelays,
 		c.wallet, c.repo, c.txBuilder, c.scanner, c.scheduler, c.NoteUriPrefix,
-		c.MarketHourStartTime, c.MarketHourEndTime, c.MarketHourPeriod, c.MarketHourRoundInterval,
+		c.MarketHourStartTime, c.MarketHourEndTime, c.MarketHourPeriod, c.MarketHourRoundInterval, c.AllowZeroFees,
 	)
 	if err != nil {
 		return err
