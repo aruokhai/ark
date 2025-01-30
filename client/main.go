@@ -113,6 +113,12 @@ var (
 		Name:  "amount",
 		Usage: "amount to send in sats",
 	}
+	zeroFeesFlag = &cli.BoolFlag{
+		Name:    "zero-fees",
+		Aliases: []string{"z"},
+		Usage:   "UNSAFE: allow sending offchain transactions with zero fees, disable unilateral exit",
+		Value:   false,
+	}
 	enableExpiryCoinselectFlag = &cli.BoolFlag{
 		Name:  "enable-expiry-coinselect",
 		Usage: "select VTXOs about to expire first",
@@ -200,7 +206,7 @@ var (
 		Action: func(ctx *cli.Context) error {
 			return send(ctx)
 		},
-		Flags: []cli.Flag{receiversFlag, toFlag, amountFlag, enableExpiryCoinselectFlag, passwordFlag},
+		Flags: []cli.Flag{receiversFlag, toFlag, amountFlag, enableExpiryCoinselectFlag, passwordFlag, zeroFeesFlag},
 	}
 	redeemCommand = cli.Command{
 		Name:  "redeem",
@@ -213,7 +219,7 @@ var (
 	notesCommand = cli.Command{
 		Name:  "redeem-notes",
 		Usage: "Redeem offchain notes",
-		Flags: []cli.Flag{notesFlag},
+		Flags: []cli.Flag{notesFlag, passwordFlag},
 		Action: func(ctx *cli.Context) error {
 			return redeemNotes(ctx)
 		},
@@ -327,6 +333,7 @@ func send(ctx *cli.Context) error {
 	receiversJSON := ctx.String(receiversFlag.Name)
 	to := ctx.String(toFlag.Name)
 	amount := ctx.Uint64(amountFlag.Name)
+	zeroFees := ctx.Bool(zeroFeesFlag.Name)
 	if receiversJSON == "" && to == "" && amount == 0 {
 		return fmt.Errorf("missing destination, use --to and --amount or --receivers")
 	}
@@ -366,7 +373,7 @@ func send(ctx *cli.Context) error {
 	}
 
 	if isBitcoin {
-		return sendCovenantLess(ctx, receivers)
+		return sendCovenantLess(ctx, receivers, zeroFees)
 	}
 	return sendCovenant(ctx, receivers)
 }
@@ -428,6 +435,15 @@ func registerNostrProfile(ctx *cli.Context) error {
 
 func redeemNotes(ctx *cli.Context) error {
 	notes := ctx.StringSlice(notesFlag.Name)
+
+	password, err := readPassword(ctx)
+	if err != nil {
+		return err
+	}
+	if err := arkSdkClient.Unlock(ctx.Context, string(password)); err != nil {
+		return err
+	}
+
 	txID, err := arkSdkClient.RedeemNotes(ctx.Context, notes)
 	if err != nil {
 		return err
@@ -526,7 +542,7 @@ func parseReceivers(receveirsJSON string, isBitcoin bool) ([]arksdk.Receiver, er
 	return receivers, nil
 }
 
-func sendCovenantLess(ctx *cli.Context, receivers []arksdk.Receiver) error {
+func sendCovenantLess(ctx *cli.Context, receivers []arksdk.Receiver, withZeroFees bool) error {
 	var onchainReceivers, offchainReceivers []arksdk.Receiver
 
 	for _, receiver := range receivers {
@@ -547,7 +563,7 @@ func sendCovenantLess(ctx *cli.Context, receivers []arksdk.Receiver) error {
 
 	computeExpiration := ctx.Bool(enableExpiryCoinselectFlag.Name)
 	redeemTx, err := arkSdkClient.SendOffChain(
-		ctx.Context, computeExpiration, offchainReceivers,
+		ctx.Context, computeExpiration, offchainReceivers, withZeroFees,
 	)
 	if err != nil {
 		return err
@@ -581,7 +597,7 @@ func sendCovenant(ctx *cli.Context, receivers []arksdk.Receiver) error {
 
 	computeExpiration := ctx.Bool(enableExpiryCoinselectFlag.Name)
 	txid, err := arkSdkClient.SendOffChain(
-		ctx.Context, computeExpiration, offchainReceivers,
+		ctx.Context, computeExpiration, offchainReceivers, false,
 	)
 	if err != nil {
 		return err

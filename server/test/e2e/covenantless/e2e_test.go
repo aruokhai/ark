@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,40 +82,125 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func TestSendOffchain(t *testing.T) {
-	var receive utils.ArkReceive
-	receiveStr, err := runClarkCommand("receive")
+func TestSettleInSameRound(t *testing.T) {
+	ctx := context.Background()
+	alice, grpcAlice := setupArkSDK(t)
+	defer grpcAlice.Close()
+
+	bob, grpcBob := setupArkSDK(t)
+	defer grpcBob.Close()
+
+	_, aliceBoardingAddress, err := alice.Receive(ctx)
 	require.NoError(t, err)
 
-	err = json.Unmarshal([]byte(receiveStr), &receive)
+	_, bobBoardingAddress, err := bob.Receive(ctx)
 	require.NoError(t, err)
 
-	_, err = utils.RunCommand("nigiri", "faucet", receive.Boarding)
+	_, err = utils.RunCommand("nigiri", "faucet", aliceBoardingAddress)
+	require.NoError(t, err)
+
+	_, err = utils.RunCommand("nigiri", "faucet", bobBoardingAddress)
 	require.NoError(t, err)
 
 	time.Sleep(5 * time.Second)
 
-	_, err = runClarkCommand("settle", "--password", utils.Password)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var aliceRoundID, bobRoundID string
+	var aliceErr, bobErr error
+
+	go func() {
+		defer wg.Done()
+		aliceRoundID, aliceErr = alice.Settle(ctx)
+	}()
+
+	go func() {
+		defer wg.Done()
+		bobRoundID, bobErr = bob.Settle(ctx)
+	}()
+
+	wg.Wait()
+
+	require.NoError(t, aliceErr)
+	require.NoError(t, bobErr)
+	require.NotEmpty(t, aliceRoundID)
+	require.NotEmpty(t, bobRoundID)
+	require.Equal(t, aliceRoundID, bobRoundID)
+
+	time.Sleep(5 * time.Second)
+
+	aliceVtxos, _, err := alice.ListVtxos(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, aliceVtxos)
+
+	bobVtxos, _, err := bob.ListVtxos(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, bobVtxos)
+
+	aliceOffchainAddr, _, err := alice.Receive(ctx)
 	require.NoError(t, err)
 
-	time.Sleep(3 * time.Second)
-
-	_, err = runClarkCommand("send", "--amount", "10000", "--to", receive.Offchain, "--password", utils.Password)
+	bobOffchainAddr, _, err := bob.Receive(ctx)
 	require.NoError(t, err)
 
-	var balance utils.ArkBalance
-	balanceStr, err := runClarkCommand("balance")
-	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal([]byte(balanceStr), &balance))
-	require.NotZero(t, balance.Offchain.Total)
-
-	_, err = runClarkCommand("settle", "--password", utils.Password)
+	// Alice sends to Bob
+	_, err = alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobOffchainAddr, 5000)}, false)
 	require.NoError(t, err)
 
-	balanceStr, err = runClarkCommand("balance")
+	// Bob sends to Alice
+	_, err = bob.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(aliceOffchainAddr, 3000)}, false)
 	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal([]byte(balanceStr), &balance))
-	require.NotZero(t, balance.Offchain.Total)
+
+	time.Sleep(2 * time.Second)
+
+	wg.Add(2)
+
+	var aliceSecondRoundID, bobSecondRoundID string
+
+	go func() {
+		defer wg.Done()
+		aliceSecondRoundID, aliceErr = alice.Settle(ctx)
+	}()
+
+	go func() {
+		defer wg.Done()
+		bobSecondRoundID, bobErr = bob.Settle(ctx)
+	}()
+
+	wg.Wait()
+
+	require.NoError(t, aliceErr)
+	require.NoError(t, bobErr)
+	require.Equal(t, aliceSecondRoundID, bobSecondRoundID, "Second settle round IDs should match")
+
+	time.Sleep(5 * time.Second)
+
+	aliceVtxosAfter, _, err := alice.ListVtxos(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, aliceVtxosAfter)
+
+	bobVtxosAfter, _, err := bob.ListVtxos(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, bobVtxosAfter)
+
+	var aliceNewVtxo, bobNewVtxo client.Vtxo
+	for _, vtxo := range aliceVtxosAfter {
+		if vtxo.RoundTxid == aliceSecondRoundID {
+			aliceNewVtxo = vtxo
+			break
+		}
+	}
+	for _, vtxo := range bobVtxosAfter {
+		if vtxo.RoundTxid == bobSecondRoundID {
+			bobNewVtxo = vtxo
+			break
+		}
+	}
+
+	require.NotEmpty(t, aliceNewVtxo)
+	require.NotEmpty(t, bobNewVtxo)
+	require.Equal(t, aliceNewVtxo.RoundTxid, bobNewVtxo.RoundTxid)
 }
 
 func TestUnilateralExit(t *testing.T) {
@@ -248,7 +334,7 @@ func TestReactToRedemptionOfVtxosSpentAsync(t *testing.T) {
 		err = utils.GenerateBlock()
 		require.NoError(t, err)
 
-		_, err = sdkClient.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(offchainAddress, 1000)})
+		_, err = sdkClient.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(offchainAddress, 1000)}, false)
 		require.NoError(t, err)
 
 		_, err = sdkClient.Settle(ctx)
@@ -395,11 +481,28 @@ func TestReactToRedemptionOfVtxosSpentAsync(t *testing.T) {
 		bobAddrStr, err := bobAddr.Encode()
 		require.NoError(t, err)
 
-		redeemTx, err := alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddrStr, sendAmount)})
+		txid, err := alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddrStr, sendAmount)}, false)
 		require.NoError(t, err)
+		require.NotEmpty(t, txid)
+
+		time.Sleep(2 * time.Second)
+
+		spendable, _, err := alice.ListVtxos(ctx)
+		require.NoError(t, err)
+		require.NotEmpty(t, spendable)
+
+		var redeemTx string
+		for _, vtxo := range spendable {
+			if vtxo.Txid == txid {
+				redeemTx = vtxo.RedeemTx
+				break
+			}
+		}
+		require.NotEmpty(t, redeemTx)
 
 		redeemPtx, err := psbt.NewFromRawBytes(strings.NewReader(redeemTx), true)
 		require.NoError(t, err)
+		require.NotNil(t, redeemPtx)
 
 		var bobOutput *wire.TxOut
 		var bobOutputIndex uint32
@@ -411,8 +514,6 @@ func TestReactToRedemptionOfVtxosSpentAsync(t *testing.T) {
 			}
 		}
 		require.NotNil(t, bobOutput)
-
-		time.Sleep(2 * time.Second)
 
 		alicePkScript, err := common.P2TRScript(aliceAddr.VtxoTapKey)
 		require.NoError(t, err)
@@ -452,13 +553,8 @@ func TestReactToRedemptionOfVtxosSpentAsync(t *testing.T) {
 			time.Sleep(1 * time.Second)
 		}
 
-		_, err = grpcTransportClient.SubmitRedeemTx(ctx, signedTx)
+		_, bobTxid, err := grpcTransportClient.SubmitRedeemTx(ctx, signedTx)
 		require.NoError(t, err)
-
-		tx, err := psbt.NewFromRawBytes(strings.NewReader(signedTx), true)
-		require.NoError(t, err)
-
-		txid := tx.UnsignedTx.TxHash().String()
 
 		aliceVtxos, _, err := alice.ListVtxos(ctx)
 		require.NoError(t, err)
@@ -467,7 +563,7 @@ func TestReactToRedemptionOfVtxosSpentAsync(t *testing.T) {
 		found := false
 
 		for _, v := range aliceVtxos {
-			if v.Txid == txid && v.VOut == 0 {
+			if v.Txid == bobTxid && v.VOut == 0 {
 				found = true
 				break
 			}
@@ -564,7 +660,7 @@ func TestAliceSendsSeveralTimesToBob(t *testing.T) {
 	bobAddress, _, err := bob.Receive(ctx)
 	require.NoError(t, err)
 
-	_, err = alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddress, 1000)})
+	_, err = alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddress, 1000)}, false)
 	require.NoError(t, err)
 
 	time.Sleep(2 * time.Second)
@@ -573,7 +669,7 @@ func TestAliceSendsSeveralTimesToBob(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, bobVtxos, 1)
 
-	_, err = alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddress, 10000)})
+	_, err = alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddress, 10000)}, false)
 	require.NoError(t, err)
 
 	time.Sleep(2 * time.Second)
@@ -582,7 +678,7 @@ func TestAliceSendsSeveralTimesToBob(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, bobVtxos, 2)
 
-	_, err = alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddress, 10000)})
+	_, err = alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddress, 10000)}, false)
 	require.NoError(t, err)
 
 	time.Sleep(2 * time.Second)
@@ -591,7 +687,7 @@ func TestAliceSendsSeveralTimesToBob(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, bobVtxos, 3)
 
-	_, err = alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddress, 10000)})
+	_, err = alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddress, 10000)}, false)
 	require.NoError(t, err)
 
 	time.Sleep(2 * time.Second)
@@ -619,7 +715,7 @@ func TestRedeemNotes(t *testing.T) {
 	var balanceBefore utils.ArkBalance
 	require.NoError(t, json.Unmarshal([]byte(balanceBeforeStr), &balanceBefore))
 
-	_, err = runClarkCommand("redeem-notes", "--notes", note)
+	_, err = runClarkCommand("redeem-notes", "--notes", note, "--password", utils.Password)
 	require.NoError(t, err)
 
 	time.Sleep(2 * time.Second)
@@ -632,7 +728,7 @@ func TestRedeemNotes(t *testing.T) {
 
 	require.Greater(t, balanceAfter.Offchain.Total, balanceBefore.Offchain.Total)
 
-	_, err = runClarkCommand("redeem-notes", "--notes", note)
+	_, err = runClarkCommand("redeem-notes", "--notes", note, "--password", utils.Password)
 	require.Error(t, err)
 }
 
@@ -728,8 +824,24 @@ func TestSendToCLTVMultisigClosure(t *testing.T) {
 	bobAddrStr, err := bobAddr.Encode()
 	require.NoError(t, err)
 
-	redeemTx, err := alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddrStr, sendAmount)})
+	txid, err := alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddrStr, sendAmount)}, false)
 	require.NoError(t, err)
+	require.NotEmpty(t, txid)
+
+	time.Sleep(2 * time.Second)
+
+	spendable, _, err := alice.ListVtxos(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, spendable)
+
+	var redeemTx string
+	for _, vtxo := range spendable {
+		if vtxo.Txid == txid {
+			redeemTx = vtxo.RedeemTx
+			break
+		}
+	}
+	require.NotEmpty(t, redeemTx)
 
 	redeemPtx, err := psbt.NewFromRawBytes(strings.NewReader(redeemTx), true)
 	require.NoError(t, err)
@@ -744,8 +856,6 @@ func TestSendToCLTVMultisigClosure(t *testing.T) {
 		}
 	}
 	require.NotNil(t, bobOutput)
-
-	time.Sleep(2 * time.Second)
 
 	alicePkScript, err := common.P2TRScript(aliceAddr.VtxoTapKey)
 	require.NoError(t, err)
@@ -779,7 +889,7 @@ func TestSendToCLTVMultisigClosure(t *testing.T) {
 	require.NoError(t, err)
 
 	// should fail because the tx is not yet valid
-	_, err = grpcAlice.SubmitRedeemTx(ctx, signedTx)
+	_, _, err = grpcAlice.SubmitRedeemTx(ctx, signedTx)
 	require.Error(t, err)
 
 	// Generate blocks to pass the timelock
@@ -789,7 +899,7 @@ func TestSendToCLTVMultisigClosure(t *testing.T) {
 		time.Sleep(1 * time.Second)
 	}
 
-	_, err = grpcAlice.SubmitRedeemTx(ctx, signedTx)
+	_, _, err = grpcAlice.SubmitRedeemTx(ctx, signedTx)
 	require.NoError(t, err)
 }
 
@@ -895,8 +1005,24 @@ func TestSendToConditionMultisigClosure(t *testing.T) {
 	bobAddrStr, err := bobAddr.Encode()
 	require.NoError(t, err)
 
-	redeemTx, err := alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddrStr, sendAmount)})
+	txid, err := alice.SendOffChain(ctx, false, []arksdk.Receiver{arksdk.NewBitcoinReceiver(bobAddrStr, sendAmount)}, false)
 	require.NoError(t, err)
+	require.NotEmpty(t, txid)
+
+	time.Sleep(2 * time.Second)
+
+	spendable, _, err := alice.ListVtxos(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, spendable)
+
+	var redeemTx string
+	for _, vtxo := range spendable {
+		if vtxo.Txid == txid {
+			redeemTx = vtxo.RedeemTx
+			break
+		}
+	}
+	require.NotEmpty(t, redeemTx)
 
 	redeemPtx, err := psbt.NewFromRawBytes(strings.NewReader(redeemTx), true)
 	require.NoError(t, err)
@@ -911,8 +1037,6 @@ func TestSendToConditionMultisigClosure(t *testing.T) {
 		}
 	}
 	require.NotNil(t, bobOutput)
-
-	time.Sleep(2 * time.Second)
 
 	alicePkScript, err := common.P2TRScript(aliceAddr.VtxoTapKey)
 	require.NoError(t, err)
@@ -954,7 +1078,7 @@ func TestSendToConditionMultisigClosure(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	_, err = grpcAlice.SubmitRedeemTx(ctx, signedTx)
+	_, _, err = grpcAlice.SubmitRedeemTx(ctx, signedTx)
 	require.NoError(t, err)
 }
 
@@ -1030,7 +1154,7 @@ func TestSweep(t *testing.T) {
 	require.NotEmpty(t, note)
 
 	// redeem the note
-	_, err = runClarkCommand("redeem-notes", "--notes", note)
+	_, err = runClarkCommand("redeem-notes", "--notes", note, "--password", utils.Password)
 	require.NoError(t, err)
 }
 

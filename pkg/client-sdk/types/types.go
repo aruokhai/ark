@@ -1,6 +1,7 @@
 package types
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -76,6 +77,7 @@ type Transaction struct {
 	Type      TxType
 	Settled   bool
 	CreatedAt time.Time
+	SpentBy   string
 }
 
 func (t Transaction) IsRound() bool {
@@ -88,6 +90,11 @@ func (t Transaction) IsBoarding() bool {
 
 func (t Transaction) IsOOR() bool {
 	return t.RedeemTxid != ""
+}
+
+func (t Transaction) String() string {
+	buf, _ := json.MarshalIndent(t, "", "  ")
+	return string(buf)
 }
 
 const (
